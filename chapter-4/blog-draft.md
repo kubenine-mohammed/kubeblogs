@@ -1,29 +1,29 @@
 # Chapter 4 — Networking in ECS: awsvpc, Service Connect, and Cloud Map
 
-In Chapter 3 we deployed a Streamlit app behind an ALB. Traffic flowed from the internet → ALB → task. That is **north-south** traffic (external to internal).
+In Chapter 3 we deployed a Streamlit service and verified tasks through the ECS console. External traffic reached tasks via a load balancer integration. That is **north-south** traffic.
 
-But what happens when one ECS service needs to talk to another? Hard-coding IP addresses is fragile — tasks come and go, IPs change. This chapter covers how ECS gives every task its own network identity, and how **Service Connect** plus **Cloud Map** give services stable, friendly names inside your cluster.
+But what happens when one ECS service needs to talk to another? Hard-coding task IP addresses is fragile — tasks restart and IPs change. This chapter covers **ECS networking features** that solve that: `awsvpc` mode, Service Connect, and Cloud Map.
 
-**Region:** `eu-north-1` (Stockholm)  
+**Region:** `eu-north-1` (or your preferred region)  
 **Launch type:** Fargate  
-**Inherited from Chapters 2–3:** `ecs-series-vpc`, `ecs-series-cluster`, `ecs-series-app-svc`
+**Inherited from Chapters 2–3:** `ecs-cluster`, `ecs-app-svc`
 
 ---
 
 ## What You'll Learn
 
-- How `awsvpc` network mode gives each task its own ENI and IP address
-- Why subnet IP planning matters with Fargate
-- How security groups work at the task level
+- How `awsvpc` network mode gives each ECS task its own ENI and IP address
+- Why subnet IP planning matters when scaling Fargate tasks
+- How security groups attach to ECS services
 - What Service Connect is and how it simplifies service-to-service calls
-- What Cloud Map does behind the scenes
-- How to configure Service Connect on the shared cluster so all later chapters inherit it
+- How Cloud Map works behind Service Connect
+- How to configure Service Connect entirely from the ECS console
 
 ---
 
 ## Theory: Networking in ECS
 
-### Network Modes (A Quick Overview)
+### Network Modes
 
 ECS supports several network modes, but **Fargate only supports `awsvpc`**. That is the mode we use throughout this series.
 
@@ -38,89 +38,84 @@ ECS supports several network modes, but **Fargate only supports `awsvpc`**. That
 
 ### awsvpc Mode and ENI-per-Task
 
-When a Fargate task starts in `awsvpc` mode, ECS creates an **Elastic Network Interface (ENI)** in the subnet you specify and assigns it a private IP address. The task's containers share that ENI.
+When a Fargate task starts in `awsvpc` mode, ECS creates an **Elastic Network Interface (ENI)** in the subnet you specify and assigns it a private IP. The task's containers share that ENI.
 
 This means:
 
 - Each task has a **unique IP** within the VPC
-- Security groups attach **directly to the task**, not the host
-- The ALB registers task **IPs** (not instance IDs) in the target group
+- Security groups attach **directly to the task** via the service configuration
+- Load balancer integrations register task **IPs** (not instance IDs)
 - You must place tasks in subnets with **enough free IP addresses**
 
-> **Analogy:** Every task gets its own **mailbox on its own street**. The ALB knows the address and delivers mail (HTTP requests) directly to it.
+> **Analogy:** Every task gets its own **mailbox on its own street**.
 
-#### IP Planning Tip
+Each Fargate task consumes **one IP address** from the subnet. Plan subnet sizes accordingly as you scale.
 
-Each Fargate task consumes **one IP address** from the subnet. If you run 10 tasks in a `/24` subnet (251 usable IPs), you are fine. But in larger deployments, IP exhaustion in a subnet is a real constraint — plan subnet sizes accordingly.
+### Security Groups on ECS Services
 
-### Security Groups at the Task Level
+When you create or update a service, you select security groups that apply to all tasks in that service. This is an ECS networking choice — not something you configure inside the task definition.
 
-Because each task has its own ENI, you attach security groups **per service** (which applies to all tasks in that service). This gives you granular control:
+For our setup:
 
-- The ALB security group (`ecs-series-alb-sg`) allows inbound HTTP from the internet
-- The app security group (`ecs-series-app-sg`) only allows inbound traffic from the ALB on port 8501
-- A backend API security group can allow inbound only from the frontend service's security group
+- `ecs-app-sg` — attached to the Streamlit service (allows inbound from the ALB)
+- `ecs-api-sg` — attached to the API service (allows inbound on port 8000 from `ecs-app-sg` only)
 
-> **Analogy:** Security groups are **bouncers at each apartment door**. The frontend bouncer only lets in guests who came through the ALB lobby. The backend bouncer only lets in guests who came from the frontend apartment.
+> **Analogy:** Security groups are **bouncers at each apartment door** — configured once per service, applied to every task that service runs.
 
 ### The Service-to-Service Problem
 
-In Chapter 3, external users reach Streamlit via the ALB. But imagine Streamlit needs to call a backend API service. You could:
+In Chapter 3, external users reach Streamlit via a load balancer integration. But when Streamlit needs to call a backend API service, you could:
 
-1. **Hard-code the API task's IP** — breaks the moment the task restarts
-2. **Use the ALB** — works, but adds latency and couples internal traffic to external routing
-3. **Use DNS-based service discovery** — the right approach
+1. **Hard-code a task IP** — breaks the moment the task restarts
+2. **Route through the ALB** — works, but adds latency and couples internal traffic to external routing
+3. **Use ECS service discovery** — the right approach
 
-ECS gives you two options for DNS-based discovery:
+ECS offers two DNS-based options:
 
 | Feature | What it does |
 |---|---|
 | **Service Discovery (Cloud Map)** | Registers service instances in a private DNS namespace |
 | **Service Connect** | Cloud Map + built-in proxy + client-side load balancing |
 
-We focus on **Service Connect** because it is the modern, recommended approach.
+We focus on **Service Connect** — the modern, ECS-native approach.
 
 ### Cloud Map — The Private Phonebook
 
-**AWS Cloud Map** is a service discovery tool. It maintains a private DNS namespace (e.g., `ecs-series.local`) and registers each running task as a DNS record.
+**AWS Cloud Map** maintains a private DNS namespace (e.g., `ecs.local`) and registers each running task as a DNS record. When tasks start and stop, records update automatically.
 
-When you create a namespace `ecs-series.local`:
-- A service named `api` becomes reachable at `api.ecs-series.local`
-- When tasks start and stop, Cloud Map updates the records automatically
+> **Analogy:** Cloud Map is the **building directory in the lobby**. Instead of memorizing apartment numbers, you look up "API Department."
 
-> **Analogy:** Cloud Map is the **building directory in the lobby**. Instead of memorizing apartment numbers, you look up "API Department" and the directory tells you where they are.
-
-Cloud Map on its own requires your application to resolve DNS and handle load balancing across multiple IPs. That is where Service Connect adds value.
+You do not need to open the Cloud Map console separately — when you enable Service Connect on an ECS service, ECS creates and manages the namespace for you.
 
 ### Service Connect — The Smart Intercom System
 
 **Amazon ECS Service Connect** builds on Cloud Map and adds:
 
-1. **Friendly short names** — call `http://api:8000` instead of `http://api.ecs-series.local:8000`
-2. **Automatic Envoy proxy** — a sidecar injected into each task handles routing
-3. **Client-side load balancing** — traffic is distributed across healthy tasks automatically
-4. **Observability** — request metrics and connection stats in the ECS console
+1. **Friendly short names** — call `http://api:8000` instead of a full DNS name
+2. **Automatic Envoy proxy** — injected into tasks that need it
+3. **Client-side load balancing** — traffic distributed across healthy tasks
+4. **Observability** — request metrics in the ECS console Service Connect tab
 
-When you configure a service as a Service Connect **client**, ECS injects a proxy container that intercepts outbound calls to configured service names and routes them correctly.
+When you configure a service as a Service Connect **server**, it advertises its port under a discovery name (e.g., `api`).
 
-When you configure a service as a Service Connect **server**, it advertises its port under a friendly DNS name that other services can call.
+When you configure a service as a Service Connect **client**, ECS injects a proxy that intercepts outbound calls to configured service names and routes them correctly.
 
-> **Analogy:** Service Connect is the **smart intercom system** in the building. You press "API" on your apartment intercom — the system connects you to any available API apartment, handles busy signals, and logs the call.
+> **Analogy:** Service Connect is the **smart intercom system**. Press "API" — the system connects you to any available API task, handles retries, and logs the call.
 
 ### How It All Fits Together
 
 ```mermaid
 flowchart LR
-    subgraph clientTask [Streamlit Task - Client]
+    subgraph clientTask [ECS Task - ecs-app-svc Client]
         streamlit[Streamlit Container\nport 8501]
         envoyClient[Service Connect Proxy]
     end
 
-    subgraph cloudMap [Cloud Map - ecs-series.local]
+    subgraph cloudMap [Cloud Map - ecs.local]
         dns["DNS: api → task IPs"]
     end
 
-    subgraph serverTasks [API Tasks - Server]
+    subgraph serverTasks [ECS Tasks - ecs-api-svc Server]
         api1[API Task 1\nport 8000]
         api2[API Task 2\nport 8000]
     end
@@ -135,242 +130,136 @@ flowchart LR
 
 ## Hands-On: Configure Service Connect on the Shared Cluster
 
-We will add a small Python API backend and wire it up with Service Connect. The Streamlit frontend (from Chapter 3) will call the API by name — `http://api:8000`.
+We will add a second ECS service (`ecs-api-svc`) and wire it to the Streamlit frontend (`ecs-app-svc`) using Service Connect. All configuration happens in the **ECS console**.
 
-All later chapters in this series inherit this Service Connect configuration.
+All later chapters in this series inherit this Service Connect setup on `ecs-cluster`.
 
 ### Prerequisites
 
-- Chapters 2 and 3 completed
-- `ecs-series-app-svc` running with 2 healthy tasks
-- Docker and AWS CLI available locally
+> *This is an ECS series. We assume you already have a VPC with private subnets, security groups (`ecs-app-sg`, `ecs-api-sg` allowing port 8000 from `ecs-app-sg`), and an ECR repo `ecs-app` with image tag `api-v1`. Chapter 1 covers that baseline.*
+
+You also need:
+
+- `ecs-cluster` with `ecs-app-svc` running (2/2 tasks from Chapter 3)
+- API image URI: `ACCOUNT_ID.dkr.ecr.AWS_REGION.amazonaws.com/ecs-app:api-v1`
 
 ---
 
-### Step 1 — Create the Cloud Map Namespace
+### Step 1 — Create the API Task Definition
 
-1. Open **Cloud Map Console** → **Namespaces** → **Create namespace**.
-2. Configure:
-   - **Namespace type:** DNS-based service discovery
-   - **Namespace name:** `ecs-series.local`
-   - **VPC:** `ecs-series-vpc`
-3. Create the namespace.
-
-<!-- SCREENSHOT: Cloud Map Console > Namespaces showing ecs-series.local with type DNS and VPC ecs-series-vpc -->
-
-Alternatively, Service Connect can create the namespace for you during service configuration — but creating it explicitly makes the setup easier to understand.
-
----
-
-### Step 2 — Build and Push the API Service Image
-
-Create a minimal FastAPI backend that returns JSON. This lives alongside the Streamlit app in the same ECR repository with a different tag.
-
-**`main.py`**
-
-```python
-import os
-from fastapi import FastAPI
-
-app = FastAPI()
-ROLE = os.getenv("ROLE", "api")
-
-@app.get("/")
-def root():
-    return {
-        "message": "Hello from the ECS API service!",
-        "role": ROLE,
-        "region": "eu-north-1"
-    }
-
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
-```
-
-**`requirements.txt`**
-
-```
-fastapi==0.110.0
-uvicorn==0.27.1
-```
-
-**`Dockerfile`**
-
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY main.py .
-
-EXPOSE 8000
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-Build, tag, and push:
-
-```bash
-docker build -t ecs-series-api:local .
-
-docker tag ecs-series-api:local \
-  ACCOUNT_ID.dkr.ecr.eu-north-1.amazonaws.com/ecs-series-app:api-v1
-
-docker push \
-  ACCOUNT_ID.dkr.ecr.eu-north-1.amazonaws.com/ecs-series-app:api-v1
-```
-
-<!-- SCREENSHOT: ECR Console > ecs-series-app showing two image tags: v1 and api-v1 -->
-
-Test locally:
-
-```bash
-docker run -p 8000:8000 ecs-series-api:local
-curl http://localhost:8000/
-```
-
----
-
-### Step 3 — Create the API Task Definition and Service (Service Connect Server)
-
-#### 3a. Task Definition
-
-1. **ECS Console** → **Task definitions** → **Create new task definition**.
+1. Open **ECS Console** → **Task definitions** → **Create new task definition**.
 2. Configure:
 
 | Setting | Value |
 |---|---|
-| Family | `ecs-series-api-td` |
+| Family | `ecs-api-td` |
 | Launch type | Fargate |
 | CPU / Memory | 0.25 vCPU / 0.5 GB |
-| Execution role | `ecsTaskExecutionRole` |
+| Task execution role | `ecsTaskExecutionRole` |
+| Network mode | awsvpc |
 
-3. Container:
+3. Add a container:
 
 | Setting | Value |
 |---|---|
 | Name | `api` |
-| Image | `ACCOUNT_ID.dkr.ecr.eu-north-1.amazonaws.com/ecs-series-app:api-v1` |
-| Port | `8000` |
-| Env var | `ROLE=api` |
+| Image | `ACCOUNT_ID.dkr.ecr.AWS_REGION.amazonaws.com/ecs-app:api-v1` |
+| Port mapping | Container port `8000`, protocol TCP |
+| Environment variable | Key: `ROLE`, Value: `api` |
+| Log configuration | Auto-configure CloudWatch log group |
 
 4. Create the task definition.
 
-<!-- SCREENSHOT: Task definition ecs-series-api-td:1 showing container api on port 8000 -->
+<!-- SCREENSHOT: ECS Console > Task definition ecs-api-td:1 showing container api on port 8000 -->
 
-#### 3b. Security Group for the API
+---
 
-Create `ecs-series-api-sg` in `ecs-series-vpc`:
+### Step 2 — Create the API Service with Service Connect (Server)
 
-- **Inbound:** TCP 8000 from `ecs-series-app-sg` (only the Streamlit service can call the API)
-- **Outbound:** Default (all traffic)
-
-<!-- SCREENSHOT: Security group ecs-series-api-sg inbound rule showing TCP 8000 from ecs-series-app-sg -->
-
-#### 3c. Create the API Service with Service Connect
-
-1. **ECS Console** → **Clusters** → `ecs-series-cluster` → **Create** → **Service**.
+1. **ECS Console** → **Clusters** → `ecs-cluster` → **Create** → **Service**.
 2. Configure:
 
 | Setting | Value |
 |---|---|
-| Task definition | `ecs-series-api-td:1` |
-| Service name | `ecs-series-api-svc` |
+| Task definition | `ecs-api-td:1` |
+| Service name | `ecs-api-svc` |
 | Desired tasks | `2` |
 
-3. **Networking:**
+3. **Networking** (select existing resources):
 
 | Setting | Value |
 |---|---|
-| VPC | `ecs-series-vpc` |
-| Subnets | Both private subnets |
-| Security group | `ecs-series-api-sg` |
+| VPC | `ecs-vpc` |
+| Subnets | Private subnets |
+| Security group | `ecs-api-sg` |
 | Public IP | OFF |
 
-4. **Service Connect** — enable and configure:
+4. **Service Connect** — enable and configure as a **server**:
 
 | Setting | Value |
 |---|---|
 | Use Service Connect | **ON** |
-| Namespace | `ecs-series.local` |
-| Service Connect configuration | **Client side only** → turn OFF (this service is a server, not a client) |
-| Port mapping | Port name: `api`, Discovery name: `api`, Port: `8000`, Client alias: `api` on port `8000` |
+| Namespace | Create new: `ecs.local` (or select existing) |
+| Port mapping | Port name: `api`, Discovery name: `api`, Port: `8000` |
+| Client alias | `api` on port `8000` |
 
-5. **Load balancing:** None (this service is internal only — no ALB).
+ECS creates the Cloud Map namespace `ecs.local` automatically when you specify it here — no separate Cloud Map console step needed.
+
+5. **Load balancing:** None — this is an internal ECS service only.
 
 6. Create the service.
 
-<!-- SCREENSHOT: Create service wizard Service Connect section showing namespace ecs-series.local, port name api, discovery name api, port 8000 -->
+<!-- SCREENSHOT: ECS Console > Create service Service Connect section showing namespace ecs.local, discovery name api, port 8000, server configuration -->
 
 Wait for 2 tasks to reach **RUNNING**.
 
-<!-- SCREENSHOT: ecs-series-cluster Services tab showing both ecs-series-app-svc and ecs-series-api-svc with desired 2/2 running -->
+<!-- SCREENSHOT: ECS Console > ecs-cluster Services tab showing ecs-app-svc and ecs-api-svc both at 2/2 running -->
 
 ---
 
-### Step 4 — Update the Streamlit Service as a Service Connect Client
+### Step 3 — Update the Streamlit Service as a Service Connect Client
 
-Now tell the Streamlit service it can reach `api` by name.
+Tell the existing Streamlit service it can reach `api` by name.
 
-1. Go to **ECS Console** → **Clusters** → `ecs-series-cluster` → **Services** → `ecs-series-app-svc`.
-2. Click **Update service**.
-3. Under **Service Connect**, enable it:
+1. **ECS Console** → **Clusters** → `ecs-cluster` → **Services** → `ecs-app-svc` → **Update service**.
+2. Under **Service Connect**, enable it:
 
 | Setting | Value |
 |---|---|
 | Use Service Connect | **ON** |
-| Namespace | `ecs-series.local` |
-| Client-only configuration | Add client alias: **Port name** `api`, **Discovery name** `api`, **Port** `8000` |
+| Namespace | `ecs.local` |
+| Client configuration | Add client alias: Port name `api`, Discovery name `api`, Port `8000` |
 
-4. Check **Force new deployment** so existing tasks are replaced with ones that have the Service Connect proxy injected.
-5. Update the service.
+3. Check **Force new deployment** — existing tasks must be replaced to receive the Service Connect proxy sidecar.
+4. Update the service.
 
-<!-- SCREENSHOT: Update service wizard showing Service Connect client configuration with api alias on port 8000 -->
+<!-- SCREENSHOT: ECS Console > Update service Service Connect section showing client alias api on port 8000 -->
 
-While the deployment rolls out, update the Streamlit app to call the API (optional but recommended for a visual demo). Add to `streamlit_app.py`:
+5. Watch the deployment in the **Deployments** tab — old tasks drain, new tasks with the proxy sidecar come up.
 
-```python
-import requests
+<!-- SCREENSHOT: ECS Console > ecs-app-svc Deployments tab showing rolling update in progress -->
 
-# ... existing code ...
-
-if st.button("Call backend API via Service Connect"):
-    try:
-        response = requests.get("http://api:8000/", timeout=5)
-        st.json(response.json())
-    except Exception as e:
-        st.error(f"Could not reach API: {e}")
-```
-
-Rebuild, push as `v2`, and update the task definition to use the new image tag. Or skip the UI button and verify with `curl` in Step 5 — both prove the same thing.
+**Optional app change:** If your Streamlit app calls the API, add a button that hits `http://api:8000/`, rebuild the image as `v2`, and update the task definition revision. Or skip the UI change and verify with ECS Exec in Step 4 — both prove the same thing.
 
 ---
 
-### Step 5 — Verify Service-to-Service Communication
+### Step 4 — Enable ECS Exec and Verify Service-to-Service Calls
 
-#### 5a. Enable ECS Exec (one-time setup)
+ECS Exec lets you open a shell inside a running container — useful for verifying Service Connect from within a task.
 
-ECS Exec lets you open a shell inside a running container — useful for debugging.
+1. When updating `ecs-app-svc`, check **Enable ECS Exec** (requires a task role with SSM permissions — attach `AmazonSSMManagedInstanceCore` if not already present).
+2. Force a new deployment if you just enabled Exec.
 
-1. Ensure the **SSM message channels** policy is attached to the task role (or create a task role with `AmazonSSMManagedInstanceCore`).
-2. When updating the Streamlit service, check **Enable ECS Exec**.
-
-#### 5b. Exec into a Streamlit Task and curl the API
+**Exec into a Streamlit task:**
 
 ```bash
-# List running tasks
 aws ecs list-tasks \
-  --cluster ecs-series-cluster \
-  --service-name ecs-series-app-svc \
+  --cluster ecs-cluster \
+  --service-name ecs-app-svc \
   --region eu-north-1
 
-# Exec into a task (replace TASK_ID)
 aws ecs execute-command \
-  --cluster ecs-series-cluster \
+  --cluster ecs-cluster \
   --task TASK_ID \
   --container app \
   --interactive \
@@ -381,10 +270,7 @@ aws ecs execute-command \
 Inside the container:
 
 ```bash
-# Install curl if not present (slim image)
 apt-get update && apt-get install -y curl
-
-# Call the API by its Service Connect name
 curl http://api:8000/
 ```
 
@@ -394,37 +280,42 @@ Expected response:
 {"message":"Hello from the ECS API service!","role":"api","region":"eu-north-1"}
 ```
 
-<!-- SCREENSHOT: Terminal showing ECS Exec session with curl http://api:8000/ returning JSON response -->
+<!-- SCREENSHOT: Terminal showing ECS Exec session with curl http://api:8000/ returning JSON -->
 
-You just called one ECS service from another using a **friendly DNS name** — no hard-coded IPs, no ALB in the middle.
-
-#### 5c. Check the Service Connect Dashboard
-
-1. Go to **ECS Console** → **Clusters** → `ecs-series-cluster`.
-2. Open the **Service Connect** tab (or view it within each service).
-3. Confirm you see:
-   - Namespace: `ecs-series.local`
-   - Server: `api` (from `ecs-series-api-svc`)
-   - Client: `api` (from `ecs-series-app-svc`)
-
-<!-- SCREENSHOT: ECS Console Service Connect tab showing namespace ecs-series.local with api server and client entries -->
+You called one ECS service from another using a **Service Connect name** — no hard-coded IPs, no load balancer in the middle.
 
 ---
 
-### Step 6 — Verify End-to-End
+### Step 5 — Review the Service Connect Dashboard
 
-Run through this checklist:
+1. Go to **ECS Console** → **Clusters** → `ecs-cluster`.
+2. Open the **Service Connect** tab.
+3. Confirm:
+   - Namespace: `ecs.local`
+   - Server: `api` (from `ecs-api-svc`)
+   - Client: `api` (from `ecs-app-svc`)
 
-| Check | Expected result |
-|---|---|
-| `ecs-series-app-svc` tasks | 2/2 RUNNING |
-| `ecs-series-api-svc` tasks | 2/2 RUNNING |
-| ALB → Streamlit | Browser loads app at ALB DNS |
-| Streamlit → API via Service Connect | `curl http://api:8000/` returns JSON from inside a Streamlit task |
-| Cloud Map namespace | `ecs-series.local` exists with registered services |
-| Security groups | API only accepts port 8000 from app SG |
+<!-- SCREENSHOT: ECS Console > ecs-cluster Service Connect tab showing namespace ecs.local with api server and client entries -->
 
-<!-- SCREENSHOT: Final architecture overview — ECS cluster with both services running, Service Connect namespace visible, ALB healthy targets -->
+4. Click into `ecs-api-svc` → **Service Connect** section to see port mappings and discovery configuration for that service.
+
+<!-- SCREENSHOT: ECS Console > ecs-api-svc detail Service Connect section showing discovery name api and port 8000 -->
+
+---
+
+### Step 6 — Verify End-to-End from ECS
+
+Run through this ECS-focused checklist:
+
+| Check | Where to look | Expected |
+|---|---|---|
+| `ecs-app-svc` tasks | Cluster → Tasks | 2/2 RUNNING |
+| `ecs-api-svc` tasks | Cluster → Tasks | 2/2 RUNNING |
+| Service Connect namespace | Cluster → Service Connect tab | `ecs.local` active |
+| Client → server call | ECS Exec + curl | JSON response from `http://api:8000/` |
+| Service events | Both services → Events | No errors |
+
+<!-- SCREENSHOT: ECS Console > ecs-cluster overview showing 2 services, 4 running tasks, Service Connect enabled -->
 
 ---
 
@@ -432,33 +323,26 @@ Run through this checklist:
 
 ```mermaid
 flowchart TB
-    user[Browser]
-
-    subgraph vpc [VPC - ecs-series-vpc]
-        subgraph publicSubnets [Public Subnets]
-            alb[ALB - ecs-series-alb\nHTTP :80]
+    subgraph ecs [ECS - ecs-cluster]
+        subgraph appSvc [ecs-app-svc - Service Connect Client]
+            st1[Streamlit Task 1]
+            st2[Streamlit Task 2]
         end
 
-        subgraph privateSubnets [Private Subnets]
-            subgraph appSvc [ecs-series-app-svc - Service Connect Client]
-                st1[Streamlit Task 1]
-                st2[Streamlit Task 2]
-            end
-
-            subgraph apiSvc [ecs-series-api-svc - Service Connect Server]
-                api1[API Task 1\n:8000]
-                api2[API Task 2\n:8000]
-            end
+        subgraph apiSvc [ecs-api-svc - Service Connect Server]
+            api1[API Task 1\n:8000]
+            api2[API Task 2\n:8000]
         end
 
-        subgraph cloudMap [Cloud Map - ecs-series.local]
+        subgraph cloudMap [Cloud Map - ecs.local]
             dns[api → task IPs]
         end
     end
 
-    user -->|"HTTP :80"| alb
-    alb -->|"HTTP :8501"| st1
-    alb -->|"HTTP :8501"| st2
+    alb[ALB Integration]
+
+    alb -->|"external traffic"| st1
+    alb -->|"external traffic"| st2
     st1 -->|"http://api:8000"| dns
     st2 -->|"http://api:8000"| dns
     dns --> api1
@@ -469,21 +353,21 @@ flowchart TB
 
 ## Key Takeaways
 
-- **`awsvpc` mode** gives every Fargate task its own ENI and IP — plan subnet sizes accordingly
-- **Security groups** attach per service, giving you task-level firewall rules
-- **Cloud Map** is the private DNS phonebook (`ecs-series.local`)
-- **Service Connect** adds a proxy, friendly names, and client-side load balancing on top of Cloud Map
-- Once configured on `ecs-series-cluster`, **every future chapter inherits this networking setup**
+- **`awsvpc` mode** gives every Fargate task its own ENI and IP — plan subnet sizes as you scale
+- **Security groups** attach per ECS service, controlling traffic to all tasks in that service
+- **Cloud Map** is the private DNS registry — ECS creates it when you enable Service Connect
+- **Service Connect** adds friendly names, a proxy sidecar, and client-side load balancing
+- Once configured on `ecs-cluster`, **every future chapter inherits this networking setup**
 
 ---
 
 ## What's Next
 
-With the shared cluster, ALB, and Service Connect namespace in place, later chapters can focus on:
+With the ECS cluster, services, and Service Connect in place, later chapters can focus on:
 
-- Auto Scaling — scale tasks based on CPU, memory, or request count
-- CI/CD — automate image builds and service deployments
+- Auto Scaling — scale ECS services based on CPU, memory, or request count
+- CI/CD — automate task definition revisions and service deployments
 - Observability — CloudWatch Container Insights, distributed tracing
 - Secrets management — pulling credentials from Secrets Manager at runtime
 
-The foundation is solid. Everything we build from here plugs into `ecs-series-cluster` with zero networking rework.
+The ECS foundation is solid. Everything we build from here plugs into `ecs-cluster` with zero networking rework.
