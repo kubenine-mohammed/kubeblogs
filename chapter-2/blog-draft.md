@@ -72,16 +72,16 @@ When you run ECS on **EC2 instances** you manage yourself, each instance runs a 
 
 ```mermaid
 flowchart TB
-    subgraph cluster [ECS Cluster - ecs-series-cluster]
-        svc[Service - ecs-series-app-svc]
-        td[Task Definition - ecs-series-app-td]
+    subgraph cluster [ECS Cluster - ecs-cluster]
+        svc[Service - ecs-app-svc]
+        td[Task Definition - ecs-app-td]
         task1[Task 1]
         task2[Task 2]
     end
 
     fargate[Fargate Control Plane]
-    ecr[ECR - ecs-series-app]
-    alb[ALB - ecs-series-alb]
+    ecr[ECR - ecs-app]
+    alb[ALB - ecs-alb]
 
     td -->|"defines how to run"| task1
     td -->|"defines how to run"| task2
@@ -105,8 +105,9 @@ Everything we build in this chapter is **shared infrastructure**. Chapters 3 and
 ### Prerequisites
 
 - An AWS account with permissions for VPC, EC2, ECR, ELB, and ECS
-- AWS CLI configured for region `eu-north-1` (optional but helpful)
-- Make sure you are in the **eu-north-1** region in the AWS Console before starting
+- AWS CLI configured for region `eu-north-1` (or any region)
+- Make sure you are in preferred region in the AWS Console before starting
+- An app image (We are using a custom streamlit app image for demo)
 
 ---
 
@@ -120,7 +121,7 @@ We need an isolated network for our ECS tasks. A good pattern is:
 1. Open the **VPC Console** → **Create VPC**.
 2. Select **VPC and more** (this wizard creates subnets, route tables, and a NAT Gateway in one go).
 3. Configure:
-   - **Name:** `ecs-series-vpc`
+   - **Name:** `ecs-vpc`
    - **IPv4 CIDR:** `10.0.0.0/16`
    - **Number of Availability Zones:** 2
    - **Number of public subnets:** 2
@@ -129,11 +130,11 @@ We need an isolated network for our ECS tasks. A good pattern is:
    - **VPC endpoints:** None for now
 4. Click **Create VPC** and wait for all resources to finish provisioning.
 
-<!-- SCREENSHOT: VPC Console > Create VPC wizard with "VPC and more" selected, name ecs-series-vpc, CIDR 10.0.0.0/16, 2 AZs, 2 public + 2 private subnets, 1 NAT gateway -->
+<!-- SCREENSHOT: VPC Console > Create VPC wizard with "VPC and more" selected, name ecs-vpc, CIDR 10.0.0.0/16, 2 AZs, 2 public + 2 private subnets, 1 NAT gateway -->
 
-<!-- SCREENSHOT: VPC Console > Your VPCs list showing ecs-series-vpc with status Available -->
+<!-- SCREENSHOT: VPC Console > Your VPCs list showing ecs-vpc with status Available -->
 
-**Why private subnets for tasks?** Your Streamlit containers should not be directly reachable from the internet. Only the ALB sits in public subnets and forwards traffic inward.
+**Why private subnets for tasks?** Your app containers should not be directly reachable from the internet. Only the ALB sits in public subnets and forwards traffic inward.
 
 ---
 
@@ -143,26 +144,26 @@ Security groups act as virtual firewalls. We need two:
 
 | Security Group | Purpose | Inbound Rules |
 |---|---|---|
-| `ecs-series-alb-sg` | Attached to the ALB | TCP 80 from `0.0.0.0/0` |
-| `ecs-series-app-sg` | Attached to ECS tasks | TCP 8501 from `ecs-series-alb-sg` only |
+| `ecs-alb-sg` | Attached to the ALB | TCP 80 from `0.0.0.0/0` |
+| `ecs-app-sg` | Attached to ECS tasks | TCP 8501 from `ecs-alb-sg` only |
 
-#### Create `ecs-series-alb-sg`
+#### Create `ecs-alb-sg`
 
 1. Go to **VPC Console** → **Security Groups** → **Create security group**.
-2. Name: `ecs-series-alb-sg`
-3. VPC: `ecs-series-vpc`
+2. Name: `ecs-alb-sg`
+3. VPC: `ecs-vpc`
 4. Inbound rule: **HTTP (80)** from **Anywhere-IPv4** (`0.0.0.0/0`)
 5. Create the security group.
 
-<!-- SCREENSHOT: Security Groups > ecs-series-alb-sg inbound rules showing HTTP port 80 from 0.0.0.0/0 -->
+<!-- SCREENSHOT: Security Groups > ecs-alb-sg inbound rules showing HTTP port 80 from 0.0.0.0/0 -->
 
-#### Create `ecs-series-app-sg`
+#### Create `ecs-app-sg`
 
-1. Create another security group named `ecs-series-app-sg` in `ecs-series-vpc`.
-2. Inbound rule: **Custom TCP (8501)** from source **`ecs-series-alb-sg`** (select the security group, not an IP range).
+1. Create another security group named `ecs-app-sg` in `ecs-vpc`.
+2. Inbound rule: **Custom TCP (8501)** from source **`ecs-alb-sg`** (select the security group, not an IP range).
 3. Leave outbound as default (all traffic allowed).
 
-<!-- SCREENSHOT: Security Groups > ecs-series-app-sg inbound rules showing TCP 8501 from ecs-series-alb-sg -->
+<!-- SCREENSHOT: Security Groups > ecs-app-sg inbound rules showing TCP 8501 from ecs-alb-sg -->
 
 > **Analogy:** Security groups are **bouncers at different doors**. The ALB bouncer lets anyone from the internet in on port 80. The app bouncer only lets people who came through the ALB door in on port 8501.
 
@@ -175,12 +176,12 @@ Amazon ECR (Elastic Container Registry) is where we store our Streamlit Docker i
 1. Open **ECR Console** → **Create repository**.
 2. Configure:
    - **Visibility:** Private
-   - **Repository name:** `ecs-series-app`
+   - **Repository name:** `ecs-app`
    - **Tag immutability:** Disabled (fine for a learning series)
    - **Scan on push:** Optional — enable if you want vulnerability scanning
 3. Click **Create repository**.
 
-<!-- SCREENSHOT: ECR Console > Repositories list showing ecs-series-app with URI like ACCOUNT.dkr.ecr.eu-north-1.amazonaws.com/ecs-series-app -->
+<!-- SCREENSHOT: ECR Console > Repositories list showing ecs-app with URI like ACCOUNT.dkr.ecr.eu-north-1.amazonaws.com/ecs-app -->
 
 Note the **URI** — you will need it in Chapter 3 when pushing your Streamlit image.
 
@@ -195,36 +196,36 @@ The ALB sits in front of our ECS tasks and distributes incoming HTTP traffic.
 1. Go to **EC2 Console** → **Target Groups** → **Create target group**.
 2. Configure:
    - **Target type:** IP addresses (required for Fargate `awsvpc` mode)
-   - **Target group name:** `ecs-series-tg`
+   - **Target group name:** `ecs-tg`
    - **Protocol:** HTTP
-   - **Port:** `8501` (Streamlit's default port)
-   - **VPC:** `ecs-series-vpc`
-   - **Health check path:** `/_stcore/health` (Streamlit's built-in health endpoint)
+   - **Port:** `8501` (Streamlit's default port, use your app's external port)
+   - **VPC:** `ecs-vpc`
+   - **Health check path:** `/`
    - **Health check interval:** 30 seconds
-3. Under **Attributes**, enable **Stickiness** (Streamlit uses WebSocket sessions — without stickiness, users may hit different tasks and lose their session).
+3. Under **Attributes**, enable **Stickiness** (Enable if your app uses WebSocket sessions — without stickiness, users may hit different page and lose their session).
 4. Skip registering targets for now — ECS will register task IPs automatically when we create the service in Chapter 3.
 5. Create the target group.
 
-<!-- SCREENSHOT: Target Groups > ecs-series-tg details showing target type IP, port 8501, health check path /_stcore/health, stickiness enabled -->
+<!-- SCREENSHOT: Target Groups > ecs-tg details showing target type IP, port 8501, health check path /_stcore/health, stickiness enabled -->
 
 #### 4b. Create the ALB
 
 1. Go to **EC2 Console** → **Load Balancers** → **Create load balancer** → **Application Load Balancer**.
 2. Configure:
-   - **Name:** `ecs-series-alb`
+   - **Name:** `ecs-alb`
    - **Scheme:** Internet-facing
    - **IP address type:** IPv4
-   - **VPC:** `ecs-series-vpc`
+   - **VPC:** `ecs-vpc`
    - **Mappings:** Select both **public subnets** (one per AZ)
-   - **Security group:** `ecs-series-alb-sg`
-3. **Listeners:** HTTP on port 80 → forward to `ecs-series-tg`
+   - **Security group:** `ecs-alb-sg`
+3. **Listeners:** HTTP on port 80 → forward to `ecs-tg`
 4. Create the load balancer and wait until the state is **Active**.
 
-<!-- SCREENSHOT: Load Balancers > ecs-series-alb showing state Active, scheme internet-facing, two public subnets selected -->
+<!-- SCREENSHOT: Load Balancers > ecs-alb showing state Active, scheme internet-facing, two public subnets selected -->
 
-<!-- SCREENSHOT: ALB Listeners tab showing HTTP:80 forwarding to ecs-series-tg -->
+<!-- SCREENSHOT: ALB Listeners tab showing HTTP:80 forwarding to ecs-tg -->
 
-Copy the **DNS name** of the ALB (e.g., `ecs-series-alb-123456789.eu-north-1.elb.amazonaws.com`). We will use it in Chapter 3 to verify the app is running.
+Copy the **DNS name** of the ALB (e.g., `ecs-alb-123456789.eu-north-1.elb.amazonaws.com`). We will use it in Chapter 3 to verify the app is running.
 
 ---
 
@@ -234,12 +235,12 @@ Finally, create the empty cluster that will hold our services.
 
 1. Open **ECS Console** → **Clusters** → **Create cluster**.
 2. Configure:
-   - **Cluster name:** `ecs-series-cluster`
-   - **Infrastructure:** Leave default AWS Fargate (serverless) selected
+   - **Cluster name:** `ecs-cluster`
+   - **Infrastructure:** We use AWS Fargate for our series
    - No EC2 capacity providers needed
 3. Click **Create**.
 
-<!-- SCREENSHOT: ECS Console > Clusters list showing ecs-series-cluster with 0 services and 0 running tasks -->
+<!-- SCREENSHOT: ECS Console > Clusters list showing ecs-cluster with 0 services and 0 running tasks -->
 
 The cluster is empty — that is expected. We have built the stage; in Chapter 3 we bring the actors.
 
@@ -251,16 +252,16 @@ Before moving on, confirm all resources exist:
 
 | Resource | Name | Status |
 |---|---|---|
-| VPC | `ecs-series-vpc` | Available |
+| VPC | `ecs-vpc` | Available |
 | Public subnets | 2 across 2 AZs | Available |
 | Private subnets | 2 across 2 AZs | Available |
 | NAT Gateway | 1 | Available |
-| Security group (ALB) | `ecs-series-alb-sg` | Created |
-| Security group (App) | `ecs-series-app-sg` | Created |
-| ECR repository | `ecs-series-app` | Created |
-| Target group | `ecs-series-tg` | Created (0 targets — expected) |
-| Load balancer | `ecs-series-alb` | Active |
-| ECS cluster | `ecs-series-cluster` | Active, 0 services |
+| Security group (ALB) | `ecs-alb-sg` | Created |
+| Security group (App) | `ecs-app-sg` | Created |
+| ECR repository | `ecs-app` | Created |
+| Target group | `ecs-tg` | Created (0 targets — expected) |
+| Load balancer | `ecs-alb` | Active |
+| ECS cluster | `ecs-cluster` | Active, 0 services |
 
 <!-- SCREENSHOT: Collage or single screenshot showing ECS cluster overview with 0 services, 0 tasks, alongside ALB DNS name visible -->
 
@@ -274,19 +275,19 @@ If every row checks out, your foundation is ready.
 flowchart TB
     internet[Internet Users]
 
-    subgraph vpc [VPC - ecs-series-vpc - 10.0.0.0/16]
+    subgraph vpc [VPC - ecs-vpc - 10.0.0.0/16]
         subgraph publicSubnets [Public Subnets]
-            alb[ALB - ecs-series-alb\necs-series-alb-sg]
+            alb[ALB - ecs-alb\necs-alb-sg]
         end
 
         subgraph privateSubnets [Private Subnets]
-            cluster[ECS Cluster - ecs-series-cluster\n0 tasks running]
+            cluster[ECS Cluster - ecs-cluster\n0 tasks running]
         end
 
         nat[NAT Gateway]
     end
 
-    ecr[ECR - ecs-series-app\nempty - image pushed in Ch3]
+    ecr[ECR - ecs-app\nempty - image pushed in Ch3]
 
     internet -->|"HTTP :80"| alb
     alb -->|"will forward :8501 in Ch3"| cluster
@@ -303,9 +304,9 @@ Nothing is deployed yet — and that is exactly where we want to be.
 
 In **Chapter 3 — Writing and Deploying a Task Definition**, we will:
 
-- Build a small Streamlit app and push it to `ecs-series-app` in ECR
-- Write our first task definition (`ecs-series-app-td`)
-- Create a service (`ecs-series-app-svc`) that keeps two tasks running behind the ALB
+- Streamlit app image will be pushed it to `ecs-app` in ECR
+- Write our first task definition (`ecs-app-td`)
+- Create a service (`ecs-app-svc`) that keeps two tasks running behind the ALB
 - Open the ALB DNS name in a browser and see our app live
 
 See you in the next chapter.
